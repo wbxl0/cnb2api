@@ -25,3 +25,4 @@ cnb2api-static
 docker/config-local.yaml
 *.log
 patches_tmp.patch
+flip_ports.py
