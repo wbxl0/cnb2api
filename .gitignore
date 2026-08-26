@@ -20,3 +20,8 @@ data/
 .DS_Store
 # Docker build artifacts (required for multi-stage builds without external images)
 cnb2api-static
+
+# 实战部署增补(wbxl0)
+docker/config-local.yaml
+*.log
+patches_tmp.patch

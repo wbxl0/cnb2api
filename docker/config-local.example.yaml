@@ -1,0 +1,39 @@
+# ToolForge 实战配置模板（复制为 config-local.yaml 后改 key）
+# 架构：客户端 → ToolForge(:7863) → cnb2api(:17863) → CNB
+# 端口对调原因见 README「踩坑实录」第 1 条
+
+server:
+  host: "0.0.0.0"
+  port: 7863
+  timeout_seconds: 180
+
+client_authentication:
+  enabled: true
+  allowed_keys:
+    - "<给客户端用的key，自定义>"
+
+upstreams:
+  - name: cnb2api
+    type: openai_compat
+    base_url: "http://localhost:17863/v1"   # 指向 cnb2api 本机端口
+    api_key: "<cnb2api 的 api_key，与 config.json 一致>"
+    models: ["deepseek-v4-flash", "deepseek-v4-pro", "*"]
+    native_fc: false          # ⚠️ CNB 不支持原生 FC，必须走 XYML 提示词路径
+    is_default: true
+
+routing:
+  aliases: {}
+
+features:
+  fc_mode: auto
+  enable_streaming: true
+  enable_fc_error_retry: true
+  fc_error_retry_max: 2
+  strip_think_tags: true
+  inject_protocol: XYML
+  convert_developer_to_system: true
+  key_passthrough: false
+  model_passthrough: false
+  enable_cli_profiles: true
+  obfuscate_tool_names: false
+  enable_metrics: true

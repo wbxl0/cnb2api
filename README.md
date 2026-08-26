@@ -5,7 +5,83 @@
 逆向自 `cnb.cool` 前端 `_app.js` 的 NPC 聊天接口，将其封装为标准 OpenAI 兼容 API，
 免登录即可调用 `npc/CodeBuddy(deepseek-v4-flash)` 等 CNB NPC。
 
-## 功能特性
+---
+
+## ⭐ Fork 实战增补（wbxl0，2026-08-25）
+
+> 本 fork 基于 [lwjlwjlwjlwj/cnb2api](https://github.com/lwjlwjlwjlwj/cnb2api)，**不影响上游**：
+> 上游更新用 `git pull upstream main` 同步。以下是真实生产环境踩坑后的增量。
+
+### 🏗 生产架构（端口对调版）
+
+```
+客户端(ZCode/Cline等) → ToolForge(:7863) → cnb2api(:17863) → CNB 上游
+                        XYML注入实现tools     Go反代+CSRF池      npc接口
+```
+
+**为什么端口对调？** 公网入口固定给 ToolForge（工具调用是刚需），
+cnb2api 退居内网 17863。客户端 key 零改动。
+
+### 🚀 快速开始（裸跑版）
+
+```bash
+# 0. 打 ToolForge 补丁（见下方坑②）
+cd docker/toolforge && git apply ../../patches/toolforge-anthropic-usage.patch && cd ../..
+
+# 1. 配置
+cp config.example.json config.json        # 改 api_key / listen=:17863
+cp docker/config-local.example.yaml docker/config-local.yaml
+
+# 2. 启动（顺序无所谓，但都要起）
+nohup ./cnb2api-static -config config.json > cnb2api.log 2>&1 &   # :17863
+cd docker/toolforge && TOOLFORGE_CONFIG=../config-local.yaml \
+  nohup python3 -m uvicorn app.main:app --host 0.0.0.0 --port 7863 &
+
+# 3. 验证
+curl http://127.0.0.1:7863/v1/chat/completions -H "Authorization: Bearer <你的key>" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}'
+```
+
+### 🕳 踩坑实录（全部亲测）
+
+#### 坑① CNB 禁原生 tools —— 必须 ToolForge 前置
+直连 cnb2api 传 `tools` 参数 → CNB 上游 403 `Agent calls are not allowed`。
+**解法**：ToolForge 用 XYML 提示词注入模拟 tool_calls（`config-local.yaml` 里 `native_fc: false` 是关键，别改 true）。
+
+#### 坑② Anthropic 流式 message_delta 缺 usage —— ZCode 直接拒收
+ToolForge 原版生成的 `message_delta` 事件不带 `usage` 字段。Anthropic 规范里这是必填，
+ZCode 等 zod 严格校验的客户端直接报：
+```
+Type validation failed: ... path ["usage"] expected object, received undefined
+```
+**解法**：应用 [`patches/toolforge-anthropic-usage.patch`](patches/toolforge-anthropic-usage.patch)（三处生成点补 `output_tokens` 估算值）。**改完必须重启 uvicorn！**
+
+#### 坑③ 端口规划混乱
+原默认两个服务都抢 7863/8080。本 fork 统一：**cnb2api=17863、ToolForge=7863（公网面）**。
+`config.json` 的 `listen` 和 `config-local.yaml` 的 `base_url` 要配套改。
+
+#### 坑④ 公网隧道别用临时的
+trycloudflare.com 临时隧道每次重启变地址 + 有频率限制。上 **Cloudflare 命名隧道**（token 方式），
+域名固定一劳永逸：
+```bash
+cloudflared tunnel --no-autoupdate run --token <CF后台拿token>
+```
+
+#### 坑⑤ 改完 ToolForge 忘重启
+Python 进程不热加载。任何 ToolForge 代码/config 改动后必须杀掉 uvicorn 重启，否则"我明明改了怎么没生效"。
+
+### 📦 本 fork 增量文件清单
+
+| 文件 | 说明 |
+|---|---|
+| `patches/toolforge-anthropic-usage.patch` | 坑②修复 |
+| `docker/config-local.example.yaml` | ToolForge 实战配置模板 |
+| `scripts/setup_toolforge.py` | 端口对调一键脚本（交互式填 key） |
+
+---
+
+## 功能特性（上游原文）
 
 - 🔓 **免登录** — 自动从 CNB 首页获取 CSRF 凭证（`csrfkey` cookie + `csrftoken` header 配对），无需账号即可调用
 - 🤖 **双模型支持** — `deepseek-v4-flash` + `deepseek-v4-pro`（均透传至 CNB 上游）
