@@ -71,6 +71,15 @@ cloudflared tunnel --no-autoupdate run --token <CF后台拿token>
 #### 坑⑤ 改完 ToolForge 忘重启
 Python 进程不热加载。任何 ToolForge 代码/config 改动后必须杀掉 uvicorn 重启，否则"我明明改了怎么没生效"。
 
+#### 坑⑥ 客户端 5 秒断连 —— cnb2api 层别做 XYML 转换
+**现象**：ZCode / opencode 等客户端接入后，发消息约 5 秒断开 / 完全无响应。
+**根因**：在 cnb2api 的 handler 里加了「XYML 提前转标准 tool_calls」的逻辑（xyProcess）。
+ToolForge 是 prompt 模式（`native_fc: false`），它**只认上游返回的原始 XYML 文本**，自己解析。
+cnb2api 一旦把 XYML 从 content 里吃掉并转成 `delta.tool_calls`，ToolForge 眼里上游就是"空内容"，
+于是输出空流 `end_turn` → 客户端等 5 秒没等到内容就超时断开。与用哪个客户端无关。
+**解法**：cnb2api 保持**纯透传**，XYML 的解析/转换统一由 ToolForge 完成，不要在 cnb2api 层碰工具协议。
+**验证**：直连 cnb2api 发带工具注入指令的请求，应看到原始 `<|XYML|tool_calls>` 文本流（而不是标准 `tool_calls` JSON）。
+
 ### 📦 本 fork 增量文件清单
 
 | 文件 | 说明 |
