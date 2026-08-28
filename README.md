@@ -128,7 +128,7 @@ cnb2api 一旦把 XYML 从 content 里吃掉并转成 `delta.tool_calls`，ToolF
 ### 1. 构建 & 配置
 
 ```bash
-git clone https://github.com/lwjlwjlwjlwj/cnb2api.git
+git clone https://github.com/wbxl0/cnb2api.git
 cd cnb2api
 go build -o cnb2api ./cmd/server
 cp config.example.json config.json
@@ -239,8 +239,8 @@ CNB 的 NPC 聊天接口 `POST /ai/chat/completions` 采用 CSRF 双因子校验
 
 ## Docker 编排（ToolForge + cnb2api）
 
-[**ToolForge**](https://github.com/YuJunZhiXue/toolforge) 是通用 LLM 工具调用中间件（原生 FC 透传 + XYML 提示词回退），
-开源仓库：<https://github.com/YuJunZhiXue/toolforge>
+[**ToolForge**](https://github.com/wbxl0/toolforge) 是通用 LLM 工具调用中间件（原生 FC 透传 + XYML 提示词回退），
+开源仓库：<https://github.com/wbxl0/toolforge>
 
 一键启动完整链路：**客户端 → ToolForge（XYML 工具调用中间件）→ cnb2api → CNB**。
 ToolForge 作为前置，通过提示词注入（XYML）实现 CNB 不原生支持的工具调用。
@@ -276,7 +276,7 @@ git submodule update --init --recursive
 
 ### 说明
 
-- ToolForge 以 git submodule 引入（`docker/toolforge` → `YuJunZhiXue/toolforge`）
+- ToolForge 以 git submodule 引入（`docker/toolforge` → `wbxl0/toolforge`）
 - 两服务共享 `cnb2api-net` 网络，ToolForge 通过容器名 `cnb2api:7863` 访问网关
 - 支持非流式 + 流式工具调用（标准 OpenAI `tool_calls` 格式）
 - 国内网络环境：Dockerfile 已使用清华 pip 镜像源，避免拉取超时
