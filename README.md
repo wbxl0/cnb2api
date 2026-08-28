@@ -80,11 +80,28 @@ cnb2api 一旦把 XYML 从 content 里吃掉并转成 `delta.tool_calls`，ToolF
 **解法**：cnb2api 保持**纯透传**，XYML 的解析/转换统一由 ToolForge 完成，不要在 cnb2api 层碰工具协议。
 **验证**：直连 cnb2api 发带工具注入指令的请求，应看到原始 `<|XYML|tool_calls>` 文本流（而不是标准 `tool_calls` JSON）。
 
+#### 坑⑦ opencode 终端排版挤压 —— ToolForge 输出层做换行硬化
+**现象**：opencode / ZCode 等终端 markdown 渲染把**单换行和硬换行都折叠成空格**，模型回复里带 emoji 状态、
+多行日志、逐条要点时（尤其"带符号图标"的内容）全部挤成一行；普通叙述段落因为用了空行所以正常。
+**根因**：终端渲染器 trim 行尾空格、再折叠单个 `\n`。模型默认爱用「行尾 2 空格 + `\n`」的硬换行或普通 `\n`
+分隔视觉行，全被折叠；emoji/日志/代码这类内容几乎全是这种单换行，所以"带符号就挤"。
+**解法**：ToolForge 输出层加换行硬化（改动在 `docker/toolforge` 子模块）：
+- `app/engine/xyml.py`：新增 `harden_line_breaks` / `harden_line_breaks_stateful` —— 代码块外每个非空行后补空行
+  （`\n\n` 任何渲染器都不折叠），代码块内换行**原样保留**；流式路径用 stateful 版本跨 chunk 维护代码围栏
+  状态（``` 被拆成两个 SSE chunk 也不会破坏代码块）。
+- `app/stream/openai_sse.py`、`app/stream/responses_sse.py`：`stream_prompt_fc` / `stream_native_passthrough`
+  输出点接入 stateful 硬化。
+- `app/engine/orchestrator.py`：`_extra_instructions` 注入 4 行精简排版约束（空行分段 + 代码进代码块 + 禁行尾空格）。
+**验证**：opencode 里普通多行、emoji 行（📅⏳✅）、代码块三块均正常分行；服务端实测 `苹果\n香蕉` → `苹果\n\n香蕉`。
+**注意**：deepseek-v4-flash 偶尔会把 emoji 状态行**主动合并成一行输出**（中间无换行符），服务端无法切分，
+属模型输出质量问题，只能靠提示词引导，重发一次通常就好了。
+
 ### 📦 本 fork 增量文件清单
 
 | 文件 | 说明 |
 |---|---|
 | `patches/toolforge-anthropic-usage.patch` | 坑②修复 |
+| `patches/toolforge-opencode-formatting.patch` | 坑⑦修复（排版换行硬化 + XYML 泄漏兜底 + Anthropic usage 补全，5 文件，在 `docker/toolforge` 上 `git apply`） |
 | `docker/config-local.example.yaml` | ToolForge 实战配置模板 |
 | `scripts/setup_toolforge.py` | 端口对调一键脚本（交互式填 key） |
 

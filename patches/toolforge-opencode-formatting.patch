@@ -1,0 +1,487 @@
+diff --git a/app/engine/orchestrator.py b/app/engine/orchestrator.py
+index fb3b082..c3c857a 100644
+--- a/app/engine/orchestrator.py
++++ b/app/engine/orchestrator.py
+@@ -17,6 +17,7 @@ from ..fc.profiles import build_few_shot_block, detect_tool_profile, profile_ins
+ from ..fc.recovery import build_retry_user_message, parse_with_recovery_hint
+ from ..models.canonical import CanonicalRequest, CanonicalResponse, Message, ToolCall
+ from ..stream.openai_sse import stream_native_passthrough, stream_prompt_fc
++from ..engine.xyml import harden_line_breaks
+ from ..stream.responses_sse import stream_responses_from_openai_chat
+ from ..upstream.router import UpstreamRouter
+ from ..util.ids import random_id
+@@ -33,6 +34,21 @@ from .wire import (
+ )
+ 
+ 
++# Replies are rendered in a terminal markdown viewer (e.g. opencode) that
++# collapses single newlines and trailing-space hard breaks into spaces. Emoji /
++# symbol-heavy rows are the worst hit. Blank lines (\\n\\n) are guaranteed to
++# survive, so instruct the model to use them and to fence code/log blocks.
++_OUTPUT_STYLE_INSTRUCTIONS = """OUTPUT FORMATTING (IMPORTANT):
++Your reply is displayed in a terminal that collapses single newlines into spaces.
++- Put a blank line between every item: paragraphs, bullet points, numbered steps, and emoji status rows. One item per line, never two items on the same line.
++- Put code, logs, JSON, cron lines and command output inside ``` fenced code blocks so their line breaks survive.
++- Never end a line with trailing spaces."""
++
++
++def _output_style_instructions() -> str:
++    return _OUTPUT_STYLE_INSTRUCTIONS
++
++
+ def _extra_instructions(req: CanonicalRequest, config: AppConfig) -> str:
+     chunks: List[str] = []
+     if config.features.enable_cli_profiles and req.tools:
+@@ -41,6 +57,7 @@ def _extra_instructions(req: CanonicalRequest, config: AppConfig) -> str:
+         few = build_few_shot_block(req.tools)
+         if few:
+             chunks.append(few)
++    chunks.append(_output_style_instructions())
+     return "\n\n".join(chunks)
+ 
+ 
+@@ -61,6 +78,12 @@ def _stream_headers(fc_mode: str) -> Dict[str, str]:
+     }
+ 
+ 
++def _estimate_out_tokens(*parts: str) -> int:
++    """粗估 output_tokens（~3字符/token，至少1）。Anthropic 规范要求 message_delta 必带 usage。"""
++    total = sum(len(p or "") for p in parts)
++    return max(1, total // 3)
++
++
+ async def _stream_anthropic_native(line_iter: AsyncIterator[str], *, model: str) -> AsyncIterator[str]:
+     """Pass-through Anthropic SSE with proper event framing and error safety."""
+     try:
+@@ -129,7 +152,7 @@ async def _stream_anthropic_prompt(
+         yield format_sse({"type": "message_stop"}, event="message_stop")
+         return
+ 
+-    full = "".join(text_parts)
++    full = harden_line_breaks("".join(text_parts))
+     calls = parse_text_to_calls(
+         full,
+         req.tools,
+@@ -185,7 +208,11 @@ async def _stream_anthropic_prompt(
+             yield format_sse({"type": "content_block_stop", "index": 0}, event="content_block_stop")
+         stop_reason = "end_turn"
+     yield format_sse(
+-        {"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}},
++        {
++            "type": "message_delta",
++            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
++            "usage": {"output_tokens": _estimate_out_tokens(full)},
++        },
+         event="message_delta",
+     )
+     yield format_sse({"type": "message_stop"}, event="message_stop")
+@@ -249,7 +276,7 @@ async def _stream_gemini(
+         yield done_frame()
+         return
+ 
+-    full = "".join(text_parts)
++    full = harden_line_breaks("".join(text_parts))
+     calls = list(native_calls)
+     if req.fc_mode == "prompt":
+         parsed = parse_text_to_calls(
+@@ -523,7 +550,11 @@ async def _stream_anthropic_from_openai_prompt(
+             yield format_sse({"type": "content_block_stop", "index": 0}, event="content_block_stop")
+         stop_reason = "end_turn"
+     yield format_sse(
+-        {"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}},
++        {
++            "type": "message_delta",
++            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
++            "usage": {"output_tokens": _estimate_out_tokens(full)},
++        },
+         event="message_delta",
+     )
+     yield format_sse({"type": "message_stop"}, event="message_stop")
+@@ -650,8 +681,15 @@ async def _stream_anthropic_from_openai_native(
+     else:
+         stop_reason = "end_turn"
+ 
++    tool_args_len = sum(len(t.get("arguments") or "") for t in tools.values())
+     yield format_sse(
+-        {"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}},
++        {
++            "type": "message_delta",
++            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
++            "usage": {
++                "output_tokens": _estimate_out_tokens(text_buf) + max(1, tool_args_len // 3)
++            },
++        },
+         event="message_delta",
+     )
+     yield format_sse({"type": "message_stop"}, event="message_stop")
+diff --git a/app/engine/wire.py b/app/engine/wire.py
+index 1bd9488..43595bb 100644
+--- a/app/engine/wire.py
++++ b/app/engine/wire.py
+@@ -15,6 +15,7 @@ from ..convert import (
+ )
+ from ..fc.inject import inject_prompt_messages, strip_tools_from_openai_body
+ from ..fc.parse import parse_text_to_calls, to_openai_tool_calls
++from .xyml import strip_residual_markup
+ from ..models.canonical import CanonicalRequest, CanonicalResponse, ToolCall, tool_defs_to_openai
+ from ..adapters.openai_chat import (
+     _openai_messages_from_canonical,
+@@ -181,7 +182,7 @@ def openai_result_to_canonical(
+             calls = native_calls
+         return CanonicalResponse(
+             model=req.model,
+-            content="" if calls else content,
++            content="" if calls else strip_residual_markup(content),
+             tool_calls=calls,
+             finish_reason="tool_calls" if calls else finish,
+             usage=usage or {},
+@@ -233,6 +234,8 @@ def anthropic_result_to_canonical(
+         if parsed:
+             calls = parsed
+             text = ""
++        else:
++            text = strip_residual_markup(text)
+     stop = str(result.get("stop_reason") or "end_turn")
+     finish = "tool_calls" if calls else ("stop" if stop == "end_turn" else stop)
+     return CanonicalResponse(
+@@ -274,6 +277,8 @@ def gemini_result_to_canonical(
+         if parsed:
+             calls = parsed
+             text = ""
++        else:
++            text = strip_residual_markup(text)
+     meta = result.get("usageMetadata") if isinstance(result.get("usageMetadata"), dict) else {}
+     usage = {
+         "prompt_tokens": meta.get("promptTokenCount") or 0,
+diff --git a/app/engine/xyml.py b/app/engine/xyml.py
+index f296c75..b5d5754 100644
+--- a/app/engine/xyml.py
++++ b/app/engine/xyml.py
+@@ -701,11 +701,15 @@ class ToolSieve:
+             if consumed:
+                 events.extend(consumed)
+             else:
+-                events.append({"type": "content", "text": self.capture})
++                cleaned = strip_residual_markup(self.capture, config=self.config)
++                if cleaned:
++                    events.append({"type": "content", "text": cleaned})
+             self.capture = ""
+             self.capturing = False
+         if self.pending:
+-            events.append({"type": "content", "text": self.pending})
++            cleaned = strip_residual_markup(self.pending, config=self.config)
++            if cleaned:
++                events.append({"type": "content", "text": cleaned})
+             self.pending = ""
+         return events
+ 
+@@ -836,7 +840,10 @@ def _extract_protocol_candidates(text: str, protocol: ProtocolSpec) -> List[str]
+ 
+ def _parse_protocol_parameters(body: str, protocol: ProtocolSpec, config: ToolCallConfig) -> Dict[str, Any]:
+     out: Dict[str, Any] = {}
+-    for match in _protocol_tag_block_re(protocol, protocol.tags["parameter"]).finditer(body):
++    parameter_re = _protocol_tag_block_re(
++        protocol, protocol.tags["parameter"], allow_short_close=True
++    )
++    for match in parameter_re.finditer(body):
+         name = _extract_name_attr(match.group(1))
+         if name:
+             out[name] = _decode_markup_value(match.group(2), name, config)
+@@ -1291,7 +1298,10 @@ def _is_path_like_arg_name(name: Any) -> bool:
+ 
+ def _path_like_arg_looks_polluted(value: str) -> bool:
+     trimmed = value.strip()
+-    if not trimmed or "\0" in trimmed or re.search(r"[\r\n<>]", trimmed):
++    # 空字符串不是污染：path-like 参数（如 workdir）经常合法地留空
++    if not trimmed:
++        return False
++    if "\0" in trimmed or re.search(r"[\r\n<>]", trimmed):
+         return True
+     lowered = trimmed.lower()
+     markers = (
+@@ -1366,15 +1376,26 @@ def _protocol_open_tag_re(protocol: ProtocolSpec, tag: str) -> re.Pattern[str]:
+     )
+ 
+ 
+-def _protocol_tag_block_re(protocol: ProtocolSpec, tag: str) -> re.Pattern[str]:
++def _protocol_tag_block_re(
++    protocol: ProtocolSpec,
++    tag: str,
++    *,
++    allow_short_close: bool = False,
++) -> re.Pattern[str]:
+     escaped_protocol = re.escape(protocol.name)
+     escaped_tag = re.escape(tag)
++    if allow_short_close:
++        # 兼容模型偶尔输出的短闭合 </|XYML>，如 <|XYML|parameter name="command"></|XYML>
++        close = r"(?:<\s*/\s*\|\s*{}\s*(?:\|\s*{}\s*)?>)".format(
++            escaped_protocol, escaped_tag
++        )
++    else:
++        close = r"<\s*/\s*\|\s*{}\s*\|\s*{}\s*>".format(
++            escaped_protocol, escaped_tag
++        )
+     return re.compile(
+-        r"<\s*\|\s*{}\s*\|\s*{}\b([^>]*)>([\s\S]*?)<\s*/\s*\|\s*{}\s*\|\s*{}\s*>".format(
+-            escaped_protocol,
+-            escaped_tag,
+-            escaped_protocol,
+-            escaped_tag,
++        r"<\s*\|\s*{}\s*\|\s*{}\b([^>]*)>([\s\S]*?){}".format(
++            escaped_protocol, escaped_tag, close
+         ),
+         re.IGNORECASE,
+     )
+@@ -1466,6 +1487,119 @@ def _first_tool_marker_index(text: str, config: ToolCallConfig) -> int:
+     return min(indexes) if indexes else -1
+ 
+ 
++def strip_residual_markup(
++    text: Any,
++    config: Optional[Union[ToolCallConfig, Mapping[str, Any]]] = None,
++    *,
++    harden: bool = True,
++) -> str:
++    """Remove leftover XYML/QNML tool-call envelopes from text before it reaches the client.
++
++    The parser intentionally drops calls that do not survive coercion (missing
++    required args, invalid values, unknown tools). In those cases the raw
++    protocol markup must not leak into the user-visible content stream.
++
++    When ``harden`` is True (default) out-of-fence line breaks are also
++    promoted to blank lines. Streaming callers should pass ``harden=False``
++    and apply :func:`harden_line_breaks_stateful` themselves so code-fence
++    state survives across chunks.
++    """
++    if not text:
++        return ""
++    raw = str(text)
++    cfg = _resolve_config(config)
++    for protocol in cfg.parse_protocols:
++        root = protocol.tags["root"]
++        # Drop full tool_calls envelopes (root block) entirely.
++        raw = _protocol_tag_block_re(
++            protocol, root, allow_short_close=True
++        ).sub("", raw)
++        # Drop standalone invoke/parameter blocks that survived without a root.
++        for tag in (protocol.tags["invoke"], protocol.tags["parameter"]):
++            raw = _protocol_tag_block_re(
++                protocol, tag, allow_short_close=True
++            ).sub("", raw)
++        # Drop loose open/close tags that no longer belong to a block.
++        raw = _protocol_open_tag_re(protocol, root).sub("", raw)
++        raw = _protocol_open_tag_re(protocol, protocol.tags["invoke"]).sub("", raw)
++        raw = _protocol_open_tag_re(protocol, protocol.tags["parameter"]).sub("", raw)
++        raw = _protocol_tag_block_re(
++            protocol, root, allow_short_close=True
++        ).sub("", raw)
++    # Last-resort: remove any residual protocol closing tags (</|XYML|invoke>,
++    # </|XYML> etc.) that block-matching may have left behind.
++    raw = re.sub(
++        r"<\s*/\s*\|\s*[A-Za-z0-9_-]+\s*(?:\|\s*[A-Za-z0-9_-]+\s*)?>",
++        "",
++        raw,
++        flags=re.IGNORECASE,
++    )
++    if harden:
++        raw = harden_line_breaks(raw)
++    return raw.strip()
++
++
++def harden_line_breaks(text: str) -> str:
++    """Promote every out-of-fence line break to a blank line.
++
++    opencode (and similar terminal markdown viewers) trims trailing spaces and
++    then collapses a lone newline into a space, so a model's hard break
++    ("  \\n") or a plain single newline outside a fenced code block renders as
++    "squashed together" rows — worst with emoji/symbol-heavy lines. A blank
++    line (\\n\\n) is never collapsed, so promote out-of-fence breaks to blank
++    lines. Inside fenced code blocks line breaks are preserved exactly.
++    """
++    if not text:
++        return text
++    out, _ = harden_line_breaks_stateful(text, in_fence=False)
++    return out
++
++
++def harden_line_breaks_stateful(
++    text: str, in_fence: bool = False
++) -> Tuple[str, bool]:
++    """Fence-aware version of :func:`harden_line_breaks` for streaming use.
++
++    Returns ``(text, in_fence)`` so callers can carry the code-fence state
++    across chunks (a ``` split across two SSE chunks must not corrupt either
++    half). Outside a fence every non-blank line is followed by a blank line so
++    a lone ``\\n`` renders as a paragraph break; inside a fence rows are kept
++    byte-for-byte.
++    """
++    if not text:
++        return text, in_fence
++    raw = str(text)
++    lines = raw.split("\n")
++    out: List[str] = []
++    fence = in_fence
++    for line in lines:
++        if line.lstrip().startswith("```"):
++            fence = not fence
++            out.append(line)
++            continue
++        if not fence and line.strip():
++            # Drop trailing whitespace (the renderer would trim it anyway) and
++            # add a blank line so a lone \n renders as a real row break.
++            out.append(line.rstrip())
++            out.append("")
++        else:
++            out.append(line)
++    # Drop trailing blank lines, then collapse any run of blank lines.
++    while out and out[-1] == "":
++        out.pop()
++    result: List[str] = []
++    prev_blank = False
++    for line in out:
++        if line == "":
++            if prev_blank:
++                continue
++            prev_blank = True
++        else:
++            prev_blank = False
++        result.append(line)
++    return "\n".join(result), fence
++
++
+ def _has_open_protocol_block(text: str, config: ToolCallConfig) -> bool:
+     return any(
+         _protocol_open_tag_re(protocol, protocol.tags["root"]).search(text)
+diff --git a/app/stream/openai_sse.py b/app/stream/openai_sse.py
+index 5540f65..904a760 100644
+--- a/app/stream/openai_sse.py
++++ b/app/stream/openai_sse.py
+@@ -9,6 +9,10 @@ from ..fc.parse import create_sieve, parse_text_to_calls, to_openai_tool_calls
+ from ..models.canonical import ToolCall, ToolDef
+ from ..util.ids import completion_id, unix_now
+ from ..util.sse import done_frame, format_sse, iter_sse_events
++from ..engine.xyml import (
++    harden_line_breaks_stateful,
++    strip_residual_markup,
++)
+ 
+ 
+ def _chunk(
+@@ -41,6 +45,7 @@ async def stream_native_passthrough(
+ ) -> AsyncIterator[str]:
+     """Forward upstream OpenAI SSE with proper multi-line event framing."""
+     finished = False
++    in_fence = False
+     try:
+         async for event in iter_sse_events(line_iter):
+             if event.is_done:
+@@ -55,6 +60,17 @@ async def stream_native_passthrough(
+                 continue
+             if model and payload.get("model") != model:
+                 payload["model"] = model
++            # Promote out-of-fence line breaks to blank lines so emoji/symbol
++            # rows are not squashed together by the terminal markdown renderer.
++            # Fence state is carried across chunks so a ``` split between two
++            # SSE chunks does not corrupt the code block.
++            for choice in payload.get("choices") or []:
++                delta = (choice or {}).get("delta") or {}
++                if delta.get("content"):
++                    hard, in_fence = harden_line_breaks_stateful(
++                        delta["content"], in_fence=in_fence
++                    )
++                    delta["content"] = hard
+             yield format_sse(payload, event=event.event)
+     except Exception as exc:  # noqa: BLE001
+         # Emit a final error-shaped chunk then DONE so clients unblock
+@@ -81,6 +97,7 @@ async def stream_prompt_fc(
+ ) -> AsyncIterator[str]:
+     sieve = create_sieve(tools, protocol=protocol)
+     chunk_id = completion_id()
++    in_fence = False
+     yield format_sse(_chunk(model=model, delta={"role": "assistant"}, chunk_id=chunk_id))
+ 
+     full_text_parts: List[str] = []
+@@ -151,6 +168,12 @@ async def stream_prompt_fc(
+             for sev in sieve.process_chunk(str(piece)):
+                 if sev.get("type") == "content":
+                     text = str(sev.get("text") or "")
++                    if text:
++                        text = strip_residual_markup(text, harden=False)
++                    if text:
++                        text, in_fence = harden_line_breaks_stateful(
++                            text, in_fence=in_fence
++                        )
+                     if text:
+                         yield format_sse(
+                             _chunk(model=model, delta={"content": text}, chunk_id=chunk_id)
+@@ -164,6 +187,12 @@ async def stream_prompt_fc(
+         for sev in sieve.flush():
+             if sev.get("type") == "content":
+                 text = str(sev.get("text") or "")
++                if text:
++                    text = strip_residual_markup(text, harden=False)
++                if text:
++                    text, in_fence = harden_line_breaks_stateful(
++                        text, in_fence=in_fence
++                    )
+                 if text:
+                     yield format_sse(_chunk(model=model, delta={"content": text}, chunk_id=chunk_id))
+             elif sev.get("type") == "tool_calls" and not emitted_calls:
+diff --git a/app/stream/responses_sse.py b/app/stream/responses_sse.py
+index ebddf4b..f3db150 100644
+--- a/app/stream/responses_sse.py
++++ b/app/stream/responses_sse.py
+@@ -14,6 +14,7 @@ from ..fc.parse import create_sieve, parse_text_to_calls
+ from ..models.canonical import ToolCall, ToolDef
+ from ..util.ids import call_id, random_id, unix_now
+ from ..util.sse import SSEEvent, format_sse, iter_sse_events
++from ..engine.xyml import harden_line_breaks_stateful, strip_residual_markup
+ 
+ 
+ def _resp_id() -> str:
+@@ -367,6 +368,7 @@ async def stream_responses_from_openai_chat(
+         yield frame
+ 
+     sieve = create_sieve(tools or [], protocol=protocol) if prompt_fc else None
++    in_fence = False
+     full_prompt_text: List[str] = []
+     usage: Dict[str, int] = {}
+     saw_done = False
+@@ -396,8 +398,16 @@ async def stream_responses_from_openai_chat(
+                     assert sieve is not None
+                     for sev in sieve.process_chunk(str(piece)):
+                         if sev.get("type") == "content":
+-                            for frame in text_delta_events(state, str(sev.get("text") or "")):
+-                                yield frame
++                            text = str(sev.get("text") or "")
++                            if text:
++                                text = strip_residual_markup(text, harden=False)
++                            if text:
++                                text, in_fence = harden_line_breaks_stateful(
++                                    text, in_fence=in_fence
++                                )
++                            if text:
++                                for frame in text_delta_events(state, text):
++                                    yield frame
+                         elif sev.get("type") == "tool_calls":
+                             # Finish any text first
+                             for frame in finish_text_item(state):
+@@ -468,8 +478,16 @@ async def stream_responses_from_openai_chat(
+         if prompt_fc and sieve is not None:
+             for sev in sieve.flush():
+                 if sev.get("type") == "content":
+-                    for frame in text_delta_events(state, str(sev.get("text") or "")):
+-                        yield frame
++                    text = str(sev.get("text") or "")
++                    if text:
++                        text = strip_residual_markup(text, harden=False)
++                    if text:
++                        text, in_fence = harden_line_breaks_stateful(
++                            text, in_fence=in_fence
++                        )
++                    if text:
++                        for frame in text_delta_events(state, text):
++                            yield frame
+                 elif sev.get("type") == "tool_calls":
+                     for frame in finish_text_item(state):
+                         yield frame
