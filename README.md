@@ -101,7 +101,7 @@ cnb2api 一旦把 XYML 从 content 里吃掉并转成 `delta.tool_calls`，ToolF
 | 文件 | 说明 |
 |---|---|
 | `patches/toolforge-anthropic-usage.patch` | 坑②修复 |
-| `patches/toolforge-opencode-formatting.patch` | 坑⑦修复（排版换行硬化 + XYML 泄漏兜底 + Anthropic usage 补全，5 文件，在 `docker/toolforge` 上 `git apply`） |
+| `patches/toolforge-opencode-formatting.patch` | 坑⑦修复（排版换行硬化 + XYML 泄漏兜底 + Anthropic usage 补全，5 文件，在 `docker/toolforge` 上 `git apply`）。修复已完整推送到 `wbxl0/toolforge`，子模块指针 = `eccb12f` |
 | `docker/config-local.example.yaml` | ToolForge 实战配置模板 |
 | `scripts/setup_toolforge.py` | 端口对调一键脚本（交互式填 key） |
 
