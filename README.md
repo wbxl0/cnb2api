@@ -240,7 +240,7 @@ CNB 的 NPC 聊天接口 `POST /ai/chat/completions` 采用 CSRF 双因子校验
 ## Docker 编排（ToolForge + cnb2api）
 
 [**ToolForge**](https://github.com/wbxl0/toolforge) 是通用 LLM 工具调用中间件（原生 FC 透传 + XYML 提示词回退），
-开源仓库：<https://github.com/wbxl0/toolforge>
+上游开源项目：<https://github.com/YuJunZhiXue/toolforge>；本项目使用其 fork（[wbxl0/toolforge](https://github.com/wbxl0/toolforge)，含坑⑦排版修复等增量）。
 
 一键启动完整链路：**客户端 → ToolForge（XYML 工具调用中间件）→ cnb2api → CNB**。
 ToolForge 作为前置，通过提示词注入（XYML）实现 CNB 不原生支持的工具调用。
@@ -276,7 +276,7 @@ git submodule update --init --recursive
 
 ### 说明
 
-- ToolForge 以 git submodule 引入（`docker/toolforge` → `wbxl0/toolforge`）
+- ToolForge 以 git submodule 引入（`docker/toolforge` → `wbxl0/toolforge`，fork 自上游 YuJunZhiXue/toolforge）
 - 两服务共享 `cnb2api-net` 网络，ToolForge 通过容器名 `cnb2api:7863` 访问网关
 - 支持非流式 + 流式工具调用（标准 OpenAI `tool_calls` 格式）
 - 国内网络环境：Dockerfile 已使用清华 pip 镜像源，避免拉取超时
