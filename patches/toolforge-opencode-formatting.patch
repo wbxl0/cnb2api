@@ -154,7 +154,7 @@ index 1bd9488..43595bb 100644
      usage = {
          "prompt_tokens": meta.get("promptTokenCount") or 0,
 diff --git a/app/engine/xyml.py b/app/engine/xyml.py
-index f296c75..b5d5754 100644
+index f296c75..87cd6ad 100644
 --- a/app/engine/xyml.py
 +++ b/app/engine/xyml.py
 @@ -701,11 +701,15 @@ class ToolSieve:
@@ -232,26 +232,17 @@ index f296c75..b5d5754 100644
          ),
          re.IGNORECASE,
      )
-@@ -1466,6 +1487,119 @@ def _first_tool_marker_index(text: str, config: ToolCallConfig) -> int:
+@@ -1466,6 +1487,209 @@ def _first_tool_marker_index(text: str, config: ToolCallConfig) -> int:
      return min(indexes) if indexes else -1
  
  
-+def strip_residual_markup(
-+    text: Any,
-+    config: Optional[Union[ToolCallConfig, Mapping[str, Any]]] = None,
-+    *,
-+    harden: bool = True,
-+) -> str:
-+    """Remove leftover XYML/QNML tool-call envelopes from text before it reaches the client.
++def _strip_markup_tags(text: Any, config: Optional[Union[ToolCallConfig, Mapping[str, Any]]] = None) -> str:
++    """Remove leftover XYML/QNML tool-call envelopes — no edge trimming.
 +
-+    The parser intentionally drops calls that do not survive coercion (missing
-+    required args, invalid values, unknown tools). In those cases the raw
-+    protocol markup must not leak into the user-visible content stream.
-+
-+    When ``harden`` is True (default) out-of-fence line breaks are also
-+    promoted to blank lines. Streaming callers should pass ``harden=False``
-+    and apply :func:`harden_line_breaks_stateful` themselves so code-fence
-+    state survives across chunks.
++    Streaming-safe: per-chunk callers must NOT trim edges (a chunk like
++    ``" Linux"`` or ``"\\n\\n"`` is pure boundary whitespace that belongs to
++    the neighbouring lines; trimming it per chunk deletes real formatting).
++    Use :func:`strip_residual_markup` for whole-text cleanup instead.
 +    """
 +    if not text:
 +        return ""
@@ -283,6 +274,23 @@ index f296c75..b5d5754 100644
 +        raw,
 +        flags=re.IGNORECASE,
 +    )
++    return raw
++
++
++def strip_residual_markup(
++    text: Any,
++    config: Optional[Union[ToolCallConfig, Mapping[str, Any]]] = None,
++    *,
++    harden: bool = True,
++) -> str:
++    """Remove leftover XYML/QNML tool-call envelopes from text before it reaches the client.
++
++    Whole-text variant: edges are trimmed, so this is only safe for complete
++    documents (non-streaming paths). Streaming callers must use
++    :func:`_strip_markup_tags` per chunk plus :class:`StreamLineHardener` —
++    see the docstring there for why per-chunk trimming corrupts formatting.
++    """
++    raw = _strip_markup_tags(text, config)
 +    if harden:
 +        raw = harden_line_breaks(raw)
 +    return raw.strip()
@@ -349,11 +357,93 @@ index f296c75..b5d5754 100644
 +    return "\n".join(result), fence
 +
 +
++class StreamLineHardener:
++    """Line-buffered, fence-aware streaming formatting hardener.
++
++    Why not :func:`harden_line_breaks_stateful` per chunk: a streaming chunk
++    has arbitrary boundaries. That function (a) trims trailing blank lines of
++    whatever it is given — so a chunk ending in ``"para\\n\\n"`` loses the
++    paragraph break, and (b) cannot see that a lone ``\\n`` at its tail is
++    followed by more content. Combined with per-chunk whitespace trimming this
++    flattened whole replies into one run-on line.
++
++    This class buffers the trailing partial line and only ever transforms
++    *complete* lines, so:
++
++    * whitespace / newlines are never lost at chunk boundaries;
++    * a `` ``` `` fence split across chunks is still detected (the buffered
++      partial line is joined before the fence check);
++    * single out-of-fence ``\\n`` is promoted to ``\\n\\n`` (same semantics as
++      :func:`harden_line_breaks`), code-fence interiors stay byte-exact.
++    """
++
++    def __init__(self, in_fence: bool = False) -> None:
++        self.fence = bool(in_fence)
++        self._buf = ""            # trailing partial line (no \n yet)
++        self._last_nonempty = False  # whether the last emitted row was non-blank
++
++    def feed(self, piece: str) -> str:
++        """Consume a stream fragment; return hardened *complete* lines (may be '')."""
++        if not piece:
++            return ""
++        data = self._buf + piece
++        idx = data.rfind("\n")
++        if idx == -1:
++            self._buf = data
++            return ""
++        complete = data[: idx + 1]
++        self._buf = data[idx + 1 :]
++        return self._harden_block(complete[:-1]) + "\n"
++
++    def flush(self) -> str:
++        """Emit the final partial line at end-of-stream (no trailing blank-line games)."""
++        tail = self._buf
++        self._buf = ""
++        if not tail:
++            return ""
++        if self.fence:
++            return tail
++        if not tail.strip():
++            return ""  # message ends in pure whitespace — drop it
++        if self._last_nonempty:
++            return "\n" + tail.rstrip()
++        return tail.rstrip()
++
++    def _harden_block(self, body: str) -> str:
++        out: List[str] = []
++        for line in body.split("\n"):
++            if line.lstrip().startswith("```"):
++                if not self.fence:
++                    # Opening a fence: still a visible row, so give it the
++                    # same blank-line separation as any other non-blank row.
++                    if (out and out[-1].strip()) or (not out and self._last_nonempty):
++                        out.append("")
++                self.fence = not self.fence
++                out.append(line)
++                self._last_nonempty = True
++                continue
++            if self.fence:
++                out.append(line)
++                self._last_nonempty = bool(line.strip())
++                continue
++            if line.strip():
++                if (out and out[-1].strip()) or (not out and self._last_nonempty):
++                    out.append("")  # promote the single \n to a blank line
++                out.append(line.rstrip())
++                self._last_nonempty = True
++            else:
++                if (out and out[-1] == "") or (not out and not self._last_nonempty):
++                    continue  # collapse runs of blank lines
++                out.append("")
++                self._last_nonempty = False
++        return "\n".join(out)
++
++
  def _has_open_protocol_block(text: str, config: ToolCallConfig) -> bool:
      return any(
          _protocol_open_tag_re(protocol, protocol.tags["root"]).search(text)
 diff --git a/app/stream/openai_sse.py b/app/stream/openai_sse.py
-index 5540f65..904a760 100644
+index 5540f65..a6297a1 100644
 --- a/app/stream/openai_sse.py
 +++ b/app/stream/openai_sse.py
 @@ -9,6 +9,10 @@ from ..fc.parse import create_sieve, parse_text_to_calls, to_openai_tool_calls
@@ -361,8 +451,8 @@ index 5540f65..904a760 100644
  from ..util.ids import completion_id, unix_now
  from ..util.sse import done_frame, format_sse, iter_sse_events
 +from ..engine.xyml import (
-+    harden_line_breaks_stateful,
-+    strip_residual_markup,
++    StreamLineHardener,
++    _strip_markup_tags,
 +)
  
  
@@ -371,71 +461,84 @@ index 5540f65..904a760 100644
  ) -> AsyncIterator[str]:
      """Forward upstream OpenAI SSE with proper multi-line event framing."""
      finished = False
-+    in_fence = False
++    hardener = StreamLineHardener()
      try:
          async for event in iter_sse_events(line_iter):
              if event.is_done:
-@@ -55,6 +60,17 @@ async def stream_native_passthrough(
+@@ -55,6 +60,19 @@ async def stream_native_passthrough(
                  continue
              if model and payload.get("model") != model:
                  payload["model"] = model
 +            # Promote out-of-fence line breaks to blank lines so emoji/symbol
 +            # rows are not squashed together by the terminal markdown renderer.
-+            # Fence state is carried across chunks so a ``` split between two
-+            # SSE chunks does not corrupt the code block.
++            # StreamLineHardener line-buffers across chunks: whitespace is
++            # never trimmed per chunk and a ``` split between two SSE chunks
++            # cannot corrupt the code block.
 +            for choice in payload.get("choices") or []:
 +                delta = (choice or {}).get("delta") or {}
 +                if delta.get("content"):
-+                    hard, in_fence = harden_line_breaks_stateful(
-+                        delta["content"], in_fence=in_fence
-+                    )
-+                    delta["content"] = hard
++                    hard = hardener.feed(delta["content"])
++                    if hard:
++                        delta["content"] = hard
++                    else:
++                        delta.pop("content", None)
              yield format_sse(payload, event=event.event)
      except Exception as exc:  # noqa: BLE001
          # Emit a final error-shaped chunk then DONE so clients unblock
-@@ -81,6 +97,7 @@ async def stream_prompt_fc(
+@@ -81,6 +99,7 @@ async def stream_prompt_fc(
  ) -> AsyncIterator[str]:
      sieve = create_sieve(tools, protocol=protocol)
      chunk_id = completion_id()
-+    in_fence = False
++    hardener = StreamLineHardener()
      yield format_sse(_chunk(model=model, delta={"role": "assistant"}, chunk_id=chunk_id))
  
      full_text_parts: List[str] = []
-@@ -151,6 +168,12 @@ async def stream_prompt_fc(
+@@ -151,6 +170,14 @@ async def stream_prompt_fc(
              for sev in sieve.process_chunk(str(piece)):
                  if sev.get("type") == "content":
                      text = str(sev.get("text") or "")
 +                    if text:
-+                        text = strip_residual_markup(text, harden=False)
++                        # Streaming-safe: strip protocol tags WITHOUT edge
++                        # trimming, then harden via the line-buffered
++                        # hardener. Per-chunk .strip() here used to delete
++                        # boundary whitespace and flatten whole replies.
++                        text = _strip_markup_tags(text)
 +                    if text:
-+                        text, in_fence = harden_line_breaks_stateful(
-+                            text, in_fence=in_fence
-+                        )
++                        text = hardener.feed(text)
                      if text:
                          yield format_sse(
                              _chunk(model=model, delta={"content": text}, chunk_id=chunk_id)
-@@ -164,6 +187,12 @@ async def stream_prompt_fc(
+@@ -164,6 +191,10 @@ async def stream_prompt_fc(
          for sev in sieve.flush():
              if sev.get("type") == "content":
                  text = str(sev.get("text") or "")
 +                if text:
-+                    text = strip_residual_markup(text, harden=False)
++                    text = _strip_markup_tags(text)
 +                if text:
-+                    text, in_fence = harden_line_breaks_stateful(
-+                        text, in_fence=in_fence
-+                    )
++                    text = hardener.feed(text)
                  if text:
                      yield format_sse(_chunk(model=model, delta={"content": text}, chunk_id=chunk_id))
              elif sev.get("type") == "tool_calls" and not emitted_calls:
+@@ -172,6 +203,10 @@ async def stream_prompt_fc(
+                     yield frame
+                 return
+ 
++        tail = hardener.flush()
++        if tail:
++            yield format_sse(_chunk(model=model, delta={"content": tail}, chunk_id=chunk_id))
++
+         if not emitted_calls:
+             full_text = "".join(full_text_parts)
+             calls = parse_text_to_calls(
 diff --git a/app/stream/responses_sse.py b/app/stream/responses_sse.py
-index ebddf4b..f3db150 100644
+index ebddf4b..8973111 100644
 --- a/app/stream/responses_sse.py
 +++ b/app/stream/responses_sse.py
 @@ -14,6 +14,7 @@ from ..fc.parse import create_sieve, parse_text_to_calls
  from ..models.canonical import ToolCall, ToolDef
  from ..util.ids import call_id, random_id, unix_now
  from ..util.sse import SSEEvent, format_sse, iter_sse_events
-+from ..engine.xyml import harden_line_breaks_stateful, strip_residual_markup
++from ..engine.xyml import StreamLineHardener, _strip_markup_tags
  
  
  def _resp_id() -> str:
@@ -443,11 +546,11 @@ index ebddf4b..f3db150 100644
          yield frame
  
      sieve = create_sieve(tools or [], protocol=protocol) if prompt_fc else None
-+    in_fence = False
++    hardener = StreamLineHardener()
      full_prompt_text: List[str] = []
      usage: Dict[str, int] = {}
      saw_done = False
-@@ -396,8 +398,16 @@ async def stream_responses_from_openai_chat(
+@@ -396,8 +398,14 @@ async def stream_responses_from_openai_chat(
                      assert sieve is not None
                      for sev in sieve.process_chunk(str(piece)):
                          if sev.get("type") == "content":
@@ -455,18 +558,16 @@ index ebddf4b..f3db150 100644
 -                                yield frame
 +                            text = str(sev.get("text") or "")
 +                            if text:
-+                                text = strip_residual_markup(text, harden=False)
++                                text = _strip_markup_tags(text)
 +                            if text:
-+                                text, in_fence = harden_line_breaks_stateful(
-+                                    text, in_fence=in_fence
-+                                )
++                                text = hardener.feed(text)
 +                            if text:
 +                                for frame in text_delta_events(state, text):
 +                                    yield frame
                          elif sev.get("type") == "tool_calls":
                              # Finish any text first
                              for frame in finish_text_item(state):
-@@ -468,8 +478,16 @@ async def stream_responses_from_openai_chat(
+@@ -468,8 +476,14 @@ async def stream_responses_from_openai_chat(
          if prompt_fc and sieve is not None:
              for sev in sieve.flush():
                  if sev.get("type") == "content":
@@ -474,14 +575,23 @@ index ebddf4b..f3db150 100644
 -                        yield frame
 +                    text = str(sev.get("text") or "")
 +                    if text:
-+                        text = strip_residual_markup(text, harden=False)
++                        text = _strip_markup_tags(text)
 +                    if text:
-+                        text, in_fence = harden_line_breaks_stateful(
-+                            text, in_fence=in_fence
-+                        )
++                        text = hardener.feed(text)
 +                    if text:
 +                        for frame in text_delta_events(state, text):
 +                            yield frame
                  elif sev.get("type") == "tool_calls":
                      for frame in finish_text_item(state):
                          yield frame
+@@ -518,6 +532,10 @@ async def stream_responses_from_openai_chat(
+                             args_delta=args_s,
+                         ):
+                             yield frame
++            tail = hardener.flush()
++            if tail:
++                for frame in text_delta_events(state, tail):
++                    yield frame
+ 
+         if state.tool_buffers:
+             for frame in finish_text_item(state):

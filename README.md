@@ -96,12 +96,27 @@ cnb2api 一旦把 XYML 从 content 里吃掉并转成 `delta.tool_calls`，ToolF
 **注意**：deepseek-v4-flash 偶尔会把 emoji 状态行**主动合并成一行输出**（中间无换行符），服务端无法切分，
 属模型输出质量问题，只能靠提示词引导，重发一次通常就好了。
 
+**第二轮实锤（2026-09-01，子模块指针 → `b25ac51`）**：上面第一轮的流式 harden 实际**没生效**——
+真正根因在它上游一步：`strip_residual_markup` 末尾的整段 `raw.strip()` 被逐 SSE-chunk 调用，
+上游每条 content 碎片（如前导空格 `' Linux'`、空白碎片 `'\n\n'`）的首尾空白被逐块剥光，
+harden 拿到的文本已经没有换行（重放实测流式输出换行数 = 0），整条回复挤成一行。
+模型自己输出的空行分段（含排版提示词引导的部分）也全被这一步吃掉。
+**修复**（仍改动 `docker/toolforge`）：
+- 抽出 `_strip_markup_tags`（纯正则剥离标签、**不 trim**）供流式逐 chunk 使用；
+  `strip_residual_markup` 保持整段 trim 语义（非流式路径不受影响）。
+- `StreamLineHardener`：行缓冲（只处理完整行，防 ``` 拆 chunk）+ fence 状态跨 chunk + 流结束 flush 残余，
+  顺带修掉三个隐藏坑：chunk 尾合法段落空行被吃、```` ``` ````拆两个 chunk 围栏状态错乱、
+  fence 开栏行前缺空行（与其他非空行同等分隔）。
+- `openai_sse.py`（native 透传 + prompt_fc 双路径）、`responses_sse.py` 全部切换；`orchestrator.py` 排版提示词沿用。
+**验证**：真实上游 SSE 重放换行 0 → 113（上游 104 + harden 补分段）、空格与引号词保留、代码块完整；
+6 项边界单测全过；线上重启后真实请求实测排版正常。
+
 ### 📦 本 fork 增量文件清单
 
 | 文件 | 说明 |
 |---|---|
 | `patches/toolforge-anthropic-usage.patch` | 坑②修复 |
-| `patches/toolforge-opencode-formatting.patch` | 坑⑦修复（排版换行硬化 + XYML 泄漏兜底 + Anthropic usage 补全，5 文件，在 `docker/toolforge` 上 `git apply`）。修复已完整推送到 `wbxl0/toolforge`，子模块指针 = `eccb12f` |
+| `patches/toolforge-opencode-formatting.patch` | 坑⑦修复（排版换行硬化 + 流式逐 chunk strip 吃空白修复 + XYML 泄漏兜底 + Anthropic usage 补全，5 文件，在 `docker/toolforge` 上 `git apply`，基线 `8d5b3b0`）。修复已完整推送到 `wbxl0/toolforge`，子模块指针 = `b25ac51` |
 | `docker/config-local.example.yaml` | ToolForge 实战配置模板 |
 | `scripts/setup_toolforge.py` | 端口对调一键脚本（交互式填 key） |
 
