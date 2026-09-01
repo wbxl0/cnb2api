@@ -7,7 +7,12 @@
 
 ---
 
-## ⭐ Fork 实战增补（wbxl0，2026-08-25）
+## ⭐ Fork 实战增补（wbxl0，2026-08-25 创建 / **2026-09-01 更新**）
+
+> **最近更新（2026-09-01）**：坑⑦补第二轮实锤——流式排版挤压的真正根因是
+> `strip_residual_markup` 被逐 SSE-chunk 调用吃光空白（第一轮 harden 因此未生效），
+> 新增 `StreamLineHardener` 行缓冲修复（子模块指针 `b25ac51`，patch 已重生成）。
+> 详见下方坑⑦「第二轮实锤」小节。
 
 > 本 fork 基于 [lwjlwjlwjlwj/cnb2api](https://github.com/lwjlwjlwjlwj/cnb2api)，**不影响上游**：
 > 上游更新用 `git pull upstream main` 同步。以下是真实生产环境踩坑后的增量。
